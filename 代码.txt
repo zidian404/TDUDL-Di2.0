@@ -1,0 +1,714 @@
+test2
+from typing import Dict, List
+import torch.utils.data as data
+import torch, cv2
+import time
+import os
+import logging
+from torchsummary import summary
+from glob import glob
+from prettytable import PrettyTable
+from torch import cuda
+import numpy as np
+import random
+import copy
+from thop import profile
+from scipy import linalg
+from collections import OrderedDict
+import Net.denoise_net as net
+from utils.dataset_admm import get_data
+import utils.utils_option as option
+from utils.dataset_admm import dataset_admm_denose
+import utils.utils_image as image
+from utils import utils_logger
+
+def safe_forward(model, img_L, noise_level):
+    """安全的模型前向传播"""
+    with torch.no_grad():
+        # 检查输入数据
+        if torch.isnan(img_L).any() or torch.isinf(img_L).any():
+            print("Warning: NaN or Inf in input")
+            img_L = torch.nan_to_num(img_L, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        if torch.isnan(noise_level).any() or torch.isinf(noise_level).any():
+            print("Warning: NaN or Inf in noise_level")
+            noise_level = torch.nan_to_num(noise_level, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        test_out, aaa = model(img_L, noise_level)
+        
+        # 检查输出
+        if torch.isnan(test_out).any() or torch.isinf(test_out).any():
+            print("Warning: NaN or Inf in output")
+            test_out = torch.nan_to_num(test_out, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        return test_out, aaa
+
+if __name__ == '__main__':
+
+    gpus = ','.join([str(i) for i in [0]])  # 使用1个GPU
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
+    device_ids = [i for i in range(torch.cuda.device_count())]
+    if torch.cuda.device_count() > 0:
+        print("\n\nLet's use", torch.cuda.device_count(), "GPU!\n\n")
+    
+    seed_=1234
+    random.seed(seed_)
+    np.random.seed(seed_)
+    torch.manual_seed(seed_)
+    cuda.manual_seed_all(seed_)
+    
+    # ------------------------
+    #     option_setting
+    # ------------------------
+    json_path = "./options/test_options.json"
+    opt = option.parse(json_path, is_train=False)
+    
+    # logger
+    logger_name = 'test'+time.strftime('%Y_%m_%d_%H-%M-%S', time.localtime())
+    utils_logger.logger_info(
+        logger_name, os.path.join(opt['log_path'], logger_name + '.log'))
+    logger = logging.getLogger(logger_name)
+    logger.info(option.dict2str(opt))
+
+    # -------------------------
+    #         dataset
+    # ------------------------
+    print("Loading test datasets...")
+    test_set = get_data(opt, 'test')
+    print(f"Loaded {len(test_set)} test sets")
+
+    test_loaders: List[data.DataLoader[dataset_admm_denose]] = []
+    for i, valid in enumerate(test_set):
+        loader = data.DataLoader(dataset=valid, batch_size=1, shuffle=False, num_workers=4, drop_last=True, pin_memory=True)
+        test_loaders.append(loader)
+        print(f"Test loader {i}: {len(loader)} batches")
+
+    # -------------------------
+    #         model
+    # ------------------------
+    print("Loading model...")
+    model = net.denoise_Net_admm_restormer(opt)
+    pretained_path = opt["pretained_path"]
+    
+    if not os.path.exists(pretained_path):
+        print(f"ERROR: Model file not found: {pretained_path}")
+        exit(1)
+    
+    print(f"Loading pretrained model from: {pretained_path}")
+    state = torch.load(pretained_path, map_location='cpu')
+    
+    if 'state_dict' in state:
+        state_dict = state['state_dict']
+    else:
+        state_dict = state
+    
+    # 移除可能的'module.'前缀
+    if all(key.startswith('module.') for key in state_dict.keys()):
+        state_dict = {k[7:]: v for k, v in state_dict.items()}
+    
+    # 加载模型
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    print(f"Model loaded! Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+    
+    model.cuda()
+    model.eval()
+
+    # 测试
+    avg_psnrs: Dict[str, List[float]] = {}
+    avg_ssims: Dict[str, List[float]] = {}
+    
+    # 获取测试图像名称
+    names = []
+    test_data_path = opt['test']['dataroot_H']
+    for name in sorted(glob(os.path.join(test_data_path, '*'))):
+        names.append(os.path.basename(name))
+    print(f"Found {len(names)} test images")
+
+    sigma_size = len(opt['test']['sigma'])
+    total_inference_time = 0
+    total_batches = 0
+
+    print(f"\nStarting full testing with {len(test_loaders)} loaders...")
+    
+    for loader_idx, test_loader in enumerate(test_loaders):
+        avg_psnr = 0.
+        avg_ssim = 0.
+        batch_count = 0
+        loader_inference_time = 0
+        
+        dataset_idx = loader_idx // sigma_size
+        if dataset_idx < len(names):
+            dataset_name = names[dataset_idx]
+        else:
+            dataset_name = f"dataset_{dataset_idx}"
+            
+        sigma_level = opt['test']['sigma'][loader_idx % sigma_size]
+        
+        print(f"\nTesting {dataset_name} with sigma={sigma_level} ({len(test_loader)} batches)")
+        
+        with torch.no_grad():
+            for batch_idx, (img_H, img_L, noise_level) in enumerate(test_loader):
+                # 进度显示
+                if batch_idx % 50 == 0:
+                    print(f'  Processing batch {batch_idx}/{len(test_loader)}')
+                
+                img_H = img_H.cuda()
+                img_L = img_L.cuda()
+                noise_level = noise_level.cuda()
+
+                start_time = time.time()
+                test_out, _ = safe_forward(model, img_L, noise_level)
+                batch_time = time.time() - start_time
+                
+                total_inference_time += batch_time
+                loader_inference_time += batch_time
+                total_batches += 1
+                batch_count += 1
+
+                # 计算指标
+                test_out_np = image.tensor2uint(test_out)
+                img_H_np = image.tensor2uint(img_H)
+                
+                psnr_ = image.calculate_psnr(test_out_np, img_H_np)
+                ssim_ = image.calculate_ssim(test_out_np, img_H_np)
+                avg_psnr += psnr_
+                avg_ssim += ssim_
+
+        # 计算该loader的平均值
+        if batch_count > 0:
+            avg_psnr = round(avg_psnr / batch_count, 2)
+            avg_ssim = round(avg_ssim * 100 / batch_count, 2)
+            avg_time = loader_inference_time / batch_count
+            
+            print(f"  Completed: PSNR={avg_psnr}, SSIM={avg_ssim}, Time={avg_time:.4f}s per image")
+            
+            if dataset_name not in avg_psnrs:
+                avg_psnrs[dataset_name] = []
+                avg_ssims[dataset_name] = []
+            
+            avg_psnrs[dataset_name].append(avg_psnr)
+            avg_ssims[dataset_name].append(avg_ssim)
+
+    # 输出最终结果
+    if total_batches > 0:
+        avg_inference_time = total_inference_time / total_batches
+        logger.info(f'Average inference time: {avg_inference_time:.4f} s per image')
+        print(f'\nAverage inference time: {avg_inference_time:.4f} s per image')
+
+    # 输出表格
+    header = ['Dataset'] + [f'σ={s}' for s in opt['test']['sigma']]
+    
+    t_psnr = PrettyTable(header)
+    for key, value in avg_psnrs.items():
+        t_psnr.add_row([key] + value)
+    
+    t_ssim = PrettyTable(header)
+    for key, value in avg_ssims.items():
+        t_ssim.add_row([key] + value)
+
+    logger.info(f"Test PSNR:\n{t_psnr}")
+    logger.info(f"Test SSIM:\n{t_ssim}")
+    
+    print(f"\nFinal Test Results:")
+    print(f"Test PSNR:\n{t_psnr}")
+    print(f"\nTest SSIM:\n{t_ssim}")
+    
+    print(f"\nTesting completed! Processed {total_batches} batches across {len(avg_psnrs)} datasets.")
+
+train2
+from typing import List
+import torch.utils.data as data
+import torch
+import time
+import os
+from tqdm import tqdm
+import logging
+from torch import optim
+import matplotlib.pyplot as plt
+from math import log
+import signal
+import sys
+import numpy as np
+
+import Net.denoise_net as net
+from utils.dataset_admm import get_data
+from utils.loss_function import loss_function
+import utils.utils_option as option
+import utils.utils_image as image
+from utils import utils_logger
+
+
+def adjust_learning_rate(opt, epo, lr_ini, max_epoch):
+    P1=50
+    P2=200-P1
+    if epo<P1:
+        lr = lr_ini * (0.65 ** (epo // (P1//log(0.1, 0.65))))
+    else:
+        lr = lr_ini * 0.1 * (0.85 ** ((epo-P1) // (P2 // log(0.1, 0.85))))
+
+    for param_group in opt.param_groups:
+        param_group['lr'] = lr
+
+
+if __name__ == '__main__':
+    # 基本设置
+    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+    device = torch.device('cuda')
+    print(f"Using GPU for training!\n")
+        
+    # 配置
+    json_path = "./options/train_options.json"
+    opt = option.parse(json_path, is_train=True)
+    logger_name = 'train'+time.strftime('%Y_%m_%d_%H-%M-%S', time.localtime())
+    utils_logger.logger_info(logger_name, os.path.join(opt['log_path'], logger_name + '.log'))
+    logger = logging.getLogger(logger_name)
+    logger.info(option.dict2str(opt))
+
+    # 数据集
+    print("加载数据集...")
+    train_set = get_data(opt, 'train')
+    valid_set = get_data(opt, 'valid')
+    
+    # 数据加载配置 - 使用适中的batch_size
+    train_loader = data.DataLoader(
+        dataset=train_set, 
+        batch_size=4,  # 适中的batch_size
+        shuffle=True, 
+        num_workers=2,
+        pin_memory=True,
+        drop_last=False
+    )
+    
+    test_loaders: List[data.DataLoader] = []
+    for valid in valid_set:
+        test_loaders.append(data.DataLoader(
+            dataset=valid, 
+            batch_size=1,
+            shuffle=False, 
+            num_workers=0, 
+            drop_last=False, 
+            pin_memory=True
+        ))
+
+    # 模型
+    print("初始化模型...")
+    model = net.denoise_Net_admm_restormer(opt)
+    model.to(device)
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=opt['lr'])
+    criterion = loss_function(opt['loss_function_index'])
+    
+    total = sum([param.nelement() for param in model.parameters()])
+    logger.info(f"Number of parameter: {total / 1e6 :.2f}M")
+    logger.info("start training...")
+
+    # 训练记录
+    start = time.time()
+    loss_train = []
+    test__loss = []
+    test__psnr = []
+    test__ssim = []
+    best_psnr = 0
+    best_epoch = 0
+    batch_accumulation = 1
+    max_accumulation = 0
+
+    if opt["pretained_path"]["index"]:
+        state = torch.load(opt['pretained_path']["path"])
+        model.load_state_dict(state['state_dict'], strict=False)
+
+    # 学习率调度器
+    reduce_schedule = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max', 
+        factor=0.85, 
+        patience=5,
+        threshold=1e-3, 
+        threshold_mode='abs',
+        cooldown=0, 
+        min_lr=0, 
+        eps=1e-8
+    )
+
+    # 调整验证频率 - 改为每10个epoch验证一次
+    eval_num = 10
+
+    # 中断信号处理
+    def signal_handler(sig, frame):
+        print(f"\n训练被中断！正在保存当前进度...")
+        torch.save({
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'loss_train': loss_train,
+            'test__psnr': test__psnr,
+            'test__ssim': test__ssim,
+            'best_psnr': best_psnr,
+            'best_epoch': best_epoch
+        }, os.path.join(opt['model_save'], 'model_interrupted.pth'))
+        print("进度已保存到 model_interrupted.pth")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    for epoch in range(0, opt["max_epoch"]):
+        try:
+            if epoch < 200:
+                adjust_learning_rate(optimizer, epoch, opt['lr'], opt['max_epoch'])
+            else:
+                if 'psnr_val_rgb' not in vars():
+                    psnr_val_rgb = 0
+                reduce_schedule.step(psnr_val_rgb)
+
+            # 训练阶段 - 不使用混合精度
+            model.train()
+            loss_epoch = 0
+            batch_count = 0
+            
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}')
+            
+            for batch_idx, (img_H, img_L, noise_level) in enumerate(pbar):
+                img_H = img_H.to(device, non_blocking=True)
+                img_L = img_L.to(device, non_blocking=True)
+                noise_level = noise_level.to(device, non_blocking=True)
+                
+                # 不使用autocast，因为模型包含矩阵求逆操作
+                output, preds = model(img_L, noise_level)
+
+                if isinstance(output, (list, tuple)):
+                    output = output[0]
+                
+                if output.dim() == 3:
+                    output = output.unsqueeze(1)
+                
+                if img_H.dim() == 3:
+                    img_H = img_H.unsqueeze(1)
+
+                loss = criterion(output, img_H) / batch_accumulation
+
+                loss.backward()
+                
+                if (batch_idx + 1) % batch_accumulation == 0:
+                    # 添加梯度裁剪防止数值问题
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                loss_epoch += loss.item() * batch_accumulation
+                batch_count += 1
+                
+                # 更新进度条
+                if batch_idx % 20 == 0:
+                    pbar.set_postfix({'Loss': f'{loss_epoch/batch_count:.4f}'})
+
+            avg_loss = loss_epoch / len(train_loader)
+            loss_train.append(avg_loss)
+            logger.info(f"epoch:[{epoch + 1}/{opt['max_epoch']}], 平均loss: {avg_loss:.4f}")
+
+            #### Evaluation - 每10个epoch验证一次，图像裁剪到256 ####
+            should_eval = (epoch + 1) % eval_num == 0  # 每10个epoch验证一次
+            
+            if should_eval:
+                print(f"\n开始验证阶段 - Epoch {epoch+1}")
+                model.eval()
+                test_loss = 0
+                test_psnr = 0
+                test_ssim = 0
+                total_batches = 0
+                valid_batches = 0
+                skip_stats = {
+                    'input_nan': 0,
+                    'output_nan': 0, 
+                    'loss_nan': 0,
+                    'other_error': 0,
+                    'timeout': 0,
+                    'image_cropped': 0
+                }
+                
+                # 三个验证集的单独结果
+                val_results = []
+                
+                with torch.no_grad():
+                    for loader_idx, test_loader in enumerate(test_loaders):
+                        print(f"\n处理验证集 {loader_idx+1}/{len(test_loaders)} (噪音水平: {opt['valid']['sigma'][loader_idx]})")
+                        val_set_batches = 0
+                        val_set_loss = 0
+                        val_set_psnr = 0
+                        val_set_ssim = 0
+                        
+                        for batch_idx, (img_H, img_L, noise_level) in enumerate(test_loader):
+                            total_batches += 1
+                            val_set_batches += 1
+                            batch_start_time = time.time()
+                            
+                            # 超时检查
+                            if time.time() - batch_start_time > 30:
+                                skip_stats['timeout'] += 1
+                                continue
+                            
+                            # 检查输入数据
+                            if torch.isnan(img_L).any() or torch.isinf(img_L).any():
+                                skip_stats['input_nan'] += 1
+                                continue
+                            
+                            # 图像尺寸裁剪 - 如果太大就中心裁剪到256x256
+                            original_shape = img_L.shape
+                            max_size = 256
+                            
+                            if img_L.shape[2] > max_size or img_L.shape[3] > max_size:
+                                H, W = img_L.shape[2], img_L.shape[3]
+                                start_h = (H - max_size) // 2
+                                start_w = (W - max_size) // 2
+                                img_L = img_L[:, :, start_h:start_h+max_size, start_w:start_w+max_size]
+                                img_H = img_H[:, :, start_h:start_h+max_size, start_w:start_w+max_size]
+                                skip_stats['image_cropped'] += 1
+                            
+                            # 数据转移到GPU
+                            img_H = img_H.to(device, non_blocking=True)
+                            img_L = img_L.to(device, non_blocking=True)
+                            noise_level = noise_level.to(device, non_blocking=True)
+                            
+                            try:
+                                # 模型前向传播
+                                test_out, _ = model(img_L, noise_level)
+                                
+                                # 检查模型输出
+                                if torch.isnan(test_out).any() or torch.isinf(test_out).any():
+                                    skip_stats['output_nan'] += 1
+                                    continue
+                                    
+                                if isinstance(test_out, (list, tuple)):
+                                    test_out = test_out[0]
+                                
+                                if test_out.dim() == 3:
+                                    test_out = test_out.unsqueeze(1)
+                                
+                                if img_H.dim() == 3:
+                                    img_H = img_H.unsqueeze(1)
+                                    
+                                current_loss = criterion(test_out, img_H).item()
+                                
+                                # 检查loss
+                                if np.isnan(current_loss) or np.isinf(current_loss):
+                                    skip_stats['loss_nan'] += 1
+                                    continue
+                                    
+                                val_set_loss += current_loss
+                                test_loss += current_loss
+                                valid_batches += 1
+                            
+                                test_out_uint = image.tensor2uint(test_out)
+                                img_H_uint = image.tensor2uint(img_H)
+                                
+                                current_psnr = image.calculate_psnr(test_out_uint, img_H_uint)
+                                current_ssim = image.calculate_ssim(test_out_uint, img_H_uint)
+                                
+                                val_set_psnr += current_psnr
+                                val_set_ssim += current_ssim
+                                test_psnr += current_psnr
+                                test_ssim += current_ssim
+                                
+                                # 每个验证集内每50个batch打印一次进度
+                                if val_set_batches % 50 == 0:
+                                    avg_psnr = val_set_psnr / val_set_batches
+                                    avg_ssim = val_set_ssim / val_set_batches
+                                    print(f"验证集{loader_idx+1}进度: {val_set_batches} batches, PSNR: {avg_psnr:.2f}, SSIM: {avg_ssim:.4f}")
+                                
+                            except Exception as e:
+                                skip_stats['other_error'] += 1
+                                continue
+                        
+                        # 记录每个验证集的结果
+                        if val_set_batches > 0:
+                            val_avg_loss = val_set_loss / val_set_batches
+                            val_avg_psnr = val_set_psnr / val_set_batches
+                            val_avg_ssim = val_set_ssim / val_set_batches
+                            val_results.append({
+                                'sigma': opt['valid']['sigma'][loader_idx],
+                                'loss': val_avg_loss,
+                                'psnr': val_avg_psnr,
+                                'ssim': val_avg_ssim,
+                                'batches': val_set_batches
+                            })
+                            print(f"验证集{loader_idx+1} (σ={opt['valid']['sigma'][loader_idx]}) 完成: {val_set_batches} batches, PSNR: {val_avg_psnr:.2f}, SSIM: {val_avg_ssim:.4f}")
+
+                # 打印验证统计
+                print(f"\n验证完成统计:")
+                print(f"总batch数: {total_batches}")
+                print(f"有效batch数: {valid_batches}")
+                print(f"图像裁剪: {skip_stats['image_cropped']}")
+
+                # 打印每个验证集的详细结果
+                print(f"\n各验证集结果:")
+                for i, result in enumerate(val_results):
+                    print(f"  验证集{i+1} (σ={result['sigma']}): PSNR: {result['psnr']:.2f}, SSIM: {result['ssim']:.4f}, Loss: {result['loss']:.4f}")
+
+                # 确保有有效的验证结果
+                if valid_batches == 0:
+                    logger.info("警告：没有有效的验证数据，跳过这个验证周期")
+                    continue
+                    
+                avg_test_loss = test_loss / valid_batches
+                psnr_val_rgb = test_psnr / valid_batches
+                ssim_val_rgb = test_ssim / valid_batches
+                
+                if psnr_val_rgb > best_psnr:
+                    max_accumulation = 0
+                    best_psnr = psnr_val_rgb
+                    best_epoch = epoch + 1
+                    torch.save({
+                        'epoch': epoch,
+                        'state_dict': model.state_dict(),
+                        'optimizer': optimizer.state_dict()
+                    }, os.path.join(opt['model_save'], "model_best.pth"))
+                    logger.info(f'保存最佳模型，PSNR: {best_psnr:.4f}')
+                else:
+                    max_accumulation += 1
+
+                logger.info(f'[epoch {epoch+1}  PSNR: {psnr_val_rgb:.4f}  Best_PSNR: {best_psnr:.4f} (epoch {best_epoch})]')
+                logger.info(f'Test metrics - Loss: {avg_test_loss:.4f}, SSIM: {ssim_val_rgb:.4f}, 有效batch数: {valid_batches}')
+                
+                test__loss.append(avg_test_loss)
+                test__psnr.append(psnr_val_rgb)
+                test__ssim.append(ssim_val_rgb)
+
+            # 保存检查点
+            if (epoch + 1) % 10 == 0:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict()
+                }, os.path.join(opt['model_save'], f'model_epoch_{epoch+1}.pth'))
+                logger.info(f'保存检查点: model_epoch_{epoch+1}.pth')
+            
+            # 保存最新模型
+            torch.save({
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict()
+            }, os.path.join(opt['model_save'], 'model_latest.pth'))
+            
+            # 早停
+            if max_accumulation >= 10:
+                logger.info(f'早停于epoch {epoch+1}')
+                break
+
+        except Exception as e:
+            print(f"训练出错: {e}, 正在保存进度...")
+            torch.save({
+                'epoch': epoch,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'loss_train': loss_train,
+                'test__psnr': test__psnr,
+                'test__ssim': test__ssim,
+                'best_psnr': best_psnr,
+                'best_epoch': best_epoch
+            }, os.path.join(opt['model_save'], 'model_error.pth'))
+            logger.error(f"训练出错，进度已保存: {e}")
+            raise e
+
+    # 训练完成
+    end = time.time()
+    training_hours = (end - start) / 3600
+    logger.info(f'总训练时间: {training_hours:.2f}小时')
+    
+    # 绘图
+    plt.figure(figsize=(12, 8))
+    plt.subplot(2, 2, 1)
+    plt.plot(loss_train)
+    plt.title("Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    
+    plt.subplot(2, 2, 2)
+    plt.plot(test__loss)
+    plt.title("Test Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    
+    plt.subplot(2, 2, 3)
+    plt.plot(test__psnr)
+    plt.title("Test PSNR")
+    plt.xlabel("Epoch")
+    plt.ylabel("PSNR")
+    
+    plt.subplot(2, 2, 4)
+    plt.plot(test__ssim)
+    plt.title("Test SSIM")
+    plt.xlabel("Epoch")
+    plt.ylabel("SSIM")
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(opt['log_path'], 'training_curves.png'))
+    logger.info('训练曲线已保存')
+
+Loading test datasets...
+Loaded 3 test sets
+Test loader 0: 240 batches
+Test loader 1: 240 batches
+Test loader 2: 240 batches
+Loading model...
+Loading pretrained model from: ./model_save/model_gray_best.pth
+Model loaded! Missing keys: 0, Unexpected keys: 0
+Found 240 test images
+
+Starting full testing with 3 loaders...
+
+Testing A04041-1405039-51_original.jpg with sigma=15 (240 batches)
+  Processing batch 0/240
+  Processing batch 50/240
+  Processing batch 100/240
+  Processing batch 150/240
+  Processing batch 200/240
+  Completed: PSNR=33.09, SSIM=89.33, Time=10.6511s per image
+
+Testing A04041-1405039-51_original.jpg with sigma=25 (240 batches)
+  Processing batch 0/240
+  Processing batch 50/240
+  Processing batch 100/240
+  Processing batch 150/240
+  Processing batch 200/240
+  Completed: PSNR=31.59, SSIM=85.6, Time=10.1862s per image
+
+Testing A04041-1405039-51_original.jpg with sigma=50 (240 batches)
+  Processing batch 0/240
+  Processing batch 50/240
+  Processing batch 100/240
+  Processing batch 150/240
+  Processing batch 200/240
+  Completed: PSNR=29.49, SSIM=78.57, Time=10.1906s per image
+[2025-11-22 20:04:04,012] : Average inference time: 10.3426 s per image
+
+Average inference time: 10.3426 s per image
+[2025-11-22 20:04:04,016] : Test PSNR:
++--------------------------------+-------+-------+-------+
+|            Dataset             |  σ=15 |  σ=25 |  σ=50 |
++--------------------------------+-------+-------+-------+
+| A04041-1405039-51_original.jpg | 33.09 | 31.59 | 29.49 |
++--------------------------------+-------+-------+-------+
+[2025-11-22 20:04:04,017] : Test SSIM:
++--------------------------------+-------+------+-------+
+|            Dataset             |  σ=15 | σ=25 |  σ=50 |
++--------------------------------+-------+------+-------+
+| A04041-1405039-51_original.jpg | 89.33 | 85.6 | 78.57 |
++--------------------------------+-------+------+-------+
+
+Final Test Results:
+Test PSNR:
++--------------------------------+-------+-------+-------+
+|            Dataset             |  σ=15 |  σ=25 |  σ=50 |
++--------------------------------+-------+-------+-------+
+| A04041-1405039-51_original.jpg | 33.09 | 31.59 | 29.49 |
++--------------------------------+-------+-------+-------+
+
+Test SSIM:
++--------------------------------+-------+------+-------+
+|            Dataset             |  σ=15 | σ=25 |  σ=50 |
++--------------------------------+-------+------+-------+
+| A04041-1405039-51_original.jpg | 89.33 | 85.6 | 78.57 |
++--------------------------------+-------+------+-------+
+
+Testing completed! Processed 720 batches across 1 datasets.
+(TDUD) PS C:\Users\CLDF\Desktop\TDUD> 

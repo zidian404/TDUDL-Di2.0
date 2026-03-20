@@ -1,0 +1,17 @@
+这是源代码复现后，再根据Di修改的文件夹
+
+文件夹里的代码是复现时的训练和测试代码与结果
+NET
+1.denoise设备修改
+2.resormer改成一样了
+ulits
+1.image np.str_ 和 np.str0 都是 NumPy 版本修改，不碍事
+2.admm测试路径修改
+option 
+路径 阶段数 GPU修改
+train/test
+数据加载，更稳妥的方式
+
+二修
+1.denoise修改Di
+2.train验证集索引有点问题，修改了
