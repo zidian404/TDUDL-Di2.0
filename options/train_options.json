@@ -5,7 +5,7 @@
   "log_path": "./log",
   "model_save": "./model_save",
   "pretained_path": {
-    "index": true,
+    "index": false,
     "path":"./model_save/model_best1.pth"
   },
   "batch_size":4,
