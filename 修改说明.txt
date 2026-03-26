@@ -19,4 +19,5 @@ train/test
 denoise
 1.wS
 2.Y-Di
+3.Y+X-Di
 
