@@ -6,6 +6,7 @@ from typing import Any
 
 from Net.restormer_arch import Restormer11
 
+
 ##########################################################################
 # Basic modules
 ##########################################################################
@@ -16,11 +17,13 @@ def conv(in_channels, out_channels, kernel_size, bias=False, stride=1):
         padding=(kernel_size // 2), bias=bias, stride=(stride, stride)
     )
 
+
 def default_conv(in_channels, out_channels, kernel_size, stride=1, bias=True):
     return nn.Conv2d(
         in_channels, out_channels, kernel_size,
         padding=(kernel_size // 2), stride=(stride, stride), bias=bias
     )
+
 
 def conv_down(in_chn, out_chn, kernel_size, stride=2, bias=False):
     return nn.Conv2d(
@@ -29,6 +32,7 @@ def conv_down(in_chn, out_chn, kernel_size, stride=2, bias=False):
         padding=(kernel_size - 1) // 2,
         bias=bias
     )
+
 
 def conv_up(in_chn, out_chn, kernel_size, stride=2, bias=False):
     return nn.ConvTranspose2d(
@@ -39,6 +43,7 @@ def conv_up(in_chn, out_chn, kernel_size, stride=2, bias=False):
         bias=bias
     )
 
+
 ##########################################################################
 # HyPaNet
 ##########################################################################
@@ -48,7 +53,7 @@ class HyPaNet(nn.Module):
         self,
         in_nc: int = 1,
         nc: int = 64,
-        out_nc: int = 5,  # alpha, rho, gamma1, gamma2, gamma3
+        out_nc: int = 5,  # 输出 5 个超参数：alpha, rho, gamma1, gamma2, gamma3
     ):
         super(HyPaNet, self).__init__()
         self.mlp = nn.Sequential(
@@ -63,6 +68,7 @@ class HyPaNet(nn.Module):
         x = (x - 0.098) / 0.0566
         x = self.mlp(x) + 1e-6  # [B,5,1,1]
         return x
+
 
 ##########################################################################
 # HeadNet
@@ -87,14 +93,16 @@ class HeadNet(nn.Module):
         x = self.head_x(torch.cat([y, sigma], dim=1))
         return x
 
+
 ##########################################################################
-# DictAdapter：S ⊙ w(i) 这一支（保持不变）
+# DictAdapter：从每幅图的系数 X 动态生成通道权重 w
 ##########################################################################
 
 class DictAdapter(nn.Module):
     """
-    输入：X [B, Cx, H, W]
-    输出：w [B, Cx, 1, 1]，用来对 X 做逐通道缩放，相当于 S⊙w(i) 这一支。
+    给共享字典 S / S_T 提供 per-image 的通道调制权重，相当于隐式的特异性字典。
+    输入：X (系数域) [B, Cx, H, W]
+    输出：w [B, Cx, 1, 1]，用于对 X 做逐通道缩放。
     """
     def __init__(self, Cx: int):
         super(DictAdapter, self).__init__()
@@ -103,106 +111,26 @@ class DictAdapter(nn.Module):
             nn.Conv2d(Cx, Cx, 1, bias=True),
             nn.ReLU(inplace=True),
             nn.Conv2d(Cx, Cx, 1, bias=True),
-            nn.Sigmoid()  # (0,1)
+            nn.Sigmoid()        # 限制在 (0,1) 区间
         )
 
     def forward(self, X: Tensor) -> Tensor:
-        g = self.pool(X)   # [B,Cx,1,1]
-        w = self.fc(g)     # [B,Cx,1,1]
+        g = self.pool(X)    # [B,Cx,1,1]
+        w = self.fc(g)      # [B,Cx,1,1]
         return w
 
-##########################################################################
-# DeltaDGenerator：ΔD(i) 这一支（新增）
-##########################################################################
-
-class DeltaDGenerator(nn.Module):
-    """
-    根据当前系数 X 生成 per-image 卷积核增量 ΔD(i)
-    X: [B, Cx, H, W]
-    输出 ΔD: [B, Cy_delta, Cx, k, k]
-    一般可以设 Cy_delta <= Cy，减少过拟合风险。
-    """
-    def __init__(self, Cx: int, Cy_delta: int, k: int, hidden: int = 64):
-        super(DeltaDGenerator, self).__init__()
-        self.Cx = Cx
-        self.Cy_delta = Cy_delta
-        self.k = k
-        out_dim = Cy_delta * Cx * k * k
-
-        self.mlp = nn.Sequential(
-            nn.Conv2d(Cx, hidden, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, out_dim, 1, bias=True)
-        )
-
-    def forward(self, X: Tensor) -> Tensor:
-        B, Cx, H, W = X.shape
-        g = F.adaptive_avg_pool2d(X, 1)          # [B,Cx,1,1]
-        z = self.mlp(g)                          # [B, Cy_delta*Cx*k*k,1,1]
-        z = z.view(B, self.Cy_delta, self.Cx, self.k, self.k)
-        return z
 
 ##########################################################################
-# ΔD 的卷积与转置卷积
-##########################################################################
-
-def apply_DeltaD(X: Tensor, DeltaD: Tensor) -> Tensor:
-    """
-    X: [B, Cx, H, W]
-    DeltaD: [B, Cy_delta, Cx, k, k]
-    返回 Y_delta: [B, Cy_delta, H, W]
-    """
-    B, Cx, H, W = X.shape
-    B2, Cy_delta, Cx2, k, k2 = DeltaD.shape
-    assert B2 == B and Cx2 == Cx and k == k2
-
-    patches = F.unfold(X, kernel_size=k, padding=k // 2)  # [B, Cx*k*k, N]
-    patches = patches.transpose(1, 2)                     # [B, N, Cx*k*k]
-    K_flat = DeltaD.view(B, Cy_delta, Cx * k * k)         # [B, Cy_delta, Cx*k*k]
-    Y_flat = torch.bmm(K_flat, patches.transpose(1, 2))   # [B, Cy_delta, N]
-    Y = F.fold(Y_flat, output_size=(H, W), kernel_size=1)
-    return Y
-
-def apply_DeltaD_T(Y: Tensor, DeltaD: Tensor) -> Tensor:
-    """
-    Y: [B, Cy_delta, H, W]
-    DeltaD: [B, Cy_delta, Cx, k, k]
-    返回 X_grad: [B, Cx, H, W]
-    """
-    B, Cy_delta, H, W = Y.shape
-    B2, Cy_delta2, Cx, k, k2 = DeltaD.shape
-    assert B2 == B and Cy_delta2 == Cy_delta and k == k2
-
-    patches = F.unfold(Y, kernel_size=k, padding=k // 2)  # [B, Cy_delta*k*k, N]
-    patches = patches.transpose(1, 2)                     # [B, N, Cy_delta*k*k]
-
-    K_T = DeltaD.permute(0, 2, 1, 3, 4).contiguous()      # [B, Cx, Cy_delta, k, k]
-    K_T_flat = K_T.view(B, Cx, Cy_delta * k * k)          # [B, Cx, Cy_delta*k*k]
-    X_flat = torch.bmm(K_T_flat, patches.transpose(1, 2)) # [B, Cx, N]
-    X_grad = F.fold(X_flat, output_size=(H, W), kernel_size=1)
-    return X_grad
-
-##########################################################################
-# BodyNet：S⊙w + ΔD，Z / beta 更新保持 ADMM 形式
+# BodyNet：共享 S / S_T + 动态适配器，Z / beta 更新形式保持 ADMM 结构
 ##########################################################################
 
 class BodyNet(nn.Module):
-    def __init__(
-        self,
-        unet,
-        S,
-        S_T,
-        dict_adapter: DictAdapter,
-        delta_gen: DeltaDGenerator,
-        delta_scale: float = 0.1
-    ):
+    def __init__(self, unet, S, S_T, dict_adapter: DictAdapter):
         super(BodyNet, self).__init__()
         self.unet = unet
         self.S = S
         self.S_T = S_T
         self.dict_adapter = dict_adapter
-        self.delta_gen = delta_gen
-        self.delta_scale = delta_scale  # 控制 ΔD 的相对权重，避免压过 S
 
     def forward(
         self,
@@ -217,96 +145,104 @@ class BodyNet(nn.Module):
         enc,
         dec
     ):
+        """
+        X_in: [B,Cx,H,W]   当前系数
+        Y:    [B,Cy,H,W]   噪声图像
+        Z, beta: [B,Cx,H,W]
+        alpha, rho, gamma[i]: [B,1,1,1]
+        """
         X = X_in
 
-        # --- S ⊙ w 部分 ---
-        w = self.dict_adapter(X)         # [B,Cx,1,1]
-        X_mod = X * w                    # [B,Cx,H,W]
-        Y_S = self.S(X_mod)              # [B,Cy,H,W]
+        # === per-image 动态适配器：w(X) ===
+        w = self.dict_adapter(X)            # [B,Cx,1,1]
+        X_mod = X * w                       # [B,Cx,H,W] 每图特异性调整
 
-        # --- ΔD 部分 ---
-        DeltaD = self.delta_gen(X)       # [B, Cy_delta, Cx, k, k]
-        Y_delta = apply_DeltaD(X, DeltaD)  # [B, Cy_delta, H, W]
-
-        # 为了和 Y 的通道对齐，这里简单用 1x1 conv 做映射
-        # 为简化，这里把 Cy_delta 设为 Cy，直接相加即可；否则需要一个映射层
-        Y_hat = Y_S + self.delta_scale * Y_delta  # [B,Cy,H,W]
+        # ---- X-step: 用共享 S / S_T + 动态调制 ----
+        # Y_hat = S(X_mod)
+        Y_hat = self.S(X_mod)              # [B,Cy,H,W]
 
         # 残差
-        res = Y_hat - Y
+        res = Y_hat - Y                    # [B,Cy,H,W]
 
-        # 梯度：共享字典分支
-        grad_S = self.S_T(res)          # [B,Cx,H,W]
-        # ΔD 分支的梯度
-        grad_D = apply_DeltaD_T(self.delta_scale * res, DeltaD)  # [B,Cx,H,W]
-
+        # 梯度：grad ≈ S_T(res) + 调制项
+        grad_S = self.S_T(res)            # [B,Cx,H,W]
+        # 为了简洁，这里用同一个 w 调制 grad，等价于 Di^T 的近似
+        grad_D = grad_S * w               # [B,Cx,H,W]
         grad = grad_S + grad_D
 
-        # X-step
+        # X_term = X - Z + beta
         X_term = X - Z + beta
+
+        # X_out = X - alpha * (grad + rho * X_term)
         X_out = X - alpha * (grad + rho * X_term)
 
-        # Z-step（Restormer）
-        rho_ = (1.0 / rho.sqrt()).repeat(1, 1, X_out.size(2), X_out.size(3))
+        # ---- Z-step（Restormer）----
+        rho_ = (1 / rho.sqrt()).repeat(1, 1, X_out.size(2), X_out.size(3))
         Z, samfeats, enc_, dec_ = self.unet(
             torch.cat([X_out, rho_], dim=1),
             samfeats, enc, dec, stage_inter=True
         )
 
-        # beta-step
+        # ---- beta-step ----
         beta = gamma[0] * beta + gamma[1] * X_out - gamma[2] * Z
 
         return X_out, Z, beta, samfeats, enc_, dec_
 
+
 ##########################################################################
-# 主网络：S⊙w + ΔD
+# 主网络：共享 S / S_T + 动态 DictAdapter（不再使用 ids/Di_param）
 ##########################################################################
 
 class denoise_Net_admm_restormer(nn.Module):
     def __init__(self, opt):
         super(denoise_Net_admm_restormer, self).__init__()
 
-        self.n_channels = opt["n_channels"]  # Cy
+        self.n_channels = opt["n_channels"]   # 图像域通道 Cy
         self.d_size = opt["d_size"]
         self.stage = opt["stage"]
 
+        # HeadNet：从 (Y, sigma) 初始化一个图像域特征
         self.headnet = HeadNet(self.n_channels, self.n_channels, 3)
 
-        self.m_channels = 16  # Cx
+        # 系数域通道 Cx
+        self.m_channels = 16
         self.stride = 1
 
+        # Restormer (Z-step): 输入 m_channels+1 -> 输出 m_channels
         self.unet = Restormer11(
-            inp_channels=self.m_channels + 1,
-            out_channels=self.m_channels,
+            inp_channels=self.m_channels + 1,  # 16 + 1 (rho)
+            out_channels=self.m_channels,      # 16
             dim=self.m_channels
         )
 
+        # ---- 共享字典 S / S_T + 动态适配器 ----
         k = self.d_size
-        Cx = self.m_channels
-        Cy = self.n_channels
+        Cx = self.m_channels   # 系数域
+        Cy = self.n_channels   # 图像域
 
-        # 共享字典 S / S_T
+        # S: 系数域 X[Cx] -> 图像域 Y[Cy]
         self.S = nn.Conv2d(Cx, Cy, k, padding=k // 2, bias=True)
+        # S_T: 图像域 Y[Cy] -> 系数域 X[Cx]
         self.S_T = nn.Conv2d(Cy, Cx, k, padding=k // 2, bias=True)
 
-        # S⊙w 部分
+        # 动态特异性适配器（per-image）
         self.dict_adapter = DictAdapter(Cx=Cx)
 
-        # ΔD 部分：这里设 Cy_delta = Cy，方便直接和 Y 相加
-        self.delta_gen = DeltaDGenerator(Cx=Cx, Cy_delta=Cy, k=k, hidden=64)
+        self.body = BodyNet(self.unet, self.S, self.S_T, self.dict_adapter)
 
-        self.body = BodyNet(
-            self.unet, self.S, self.S_T,
-            self.dict_adapter, self.delta_gen,
-            delta_scale=0.1  # 可以以后调参
-        )
-
+        # 每个 stage 的 HyPaNet
         self.hypa_list_: nn.ModuleList = nn.ModuleList()
         for _ in range(self.stage):
             self.hypa_list_.append(HyPaNet(in_nc=1, out_nc=5))
 
     def forward(self, input: Tensor, sigma: Tensor):
+        """
+        input: [B,Cy,H,W] 噪声图像 Y
+        sigma: [B] / [B,1] / [B,1,1] / [B,1,1,1] 噪声标准差
+        """
         device = input.device
+
+        # sigma -> [B,1,1,1]
         sigma = sigma.to(device)
         if sigma.dim() == 1:
             sigma = sigma.view(-1, 1, 1, 1)
@@ -314,19 +250,23 @@ class denoise_Net_admm_restormer(nn.Module):
             sigma = sigma.view(sigma.size(0), 1, 1, 1)
         elif sigma.dim() == 3:
             sigma = sigma.view(sigma.size(0), 1, 1, 1)
+        # 若已是 [B,1,1,1] 则不变
 
-        # 初始化 X^0
-        X_img0 = self.headnet(input, sigma)  # [B,Cy,H,W]
-        X = self.S_T(X_img0)                 # [B,Cx,H,W]
+        # 初始化 X^0：
+        # 先用 HeadNet 得到一个图像域特征，再用 S_T 映射到系数域
+        X_img0 = self.headnet(input, sigma)   # [B,Cy,H,W]
+        X = self.S_T(X_img0)                 # [B,Cx,H,W] 作为 X^0
 
         preds = []
         Z = torch.zeros_like(X)
         beta = torch.zeros_like(X)
+
         samfeats = enc = dec = None
 
         for k in range(self.stage):
-            hypas = self.hypa_list_[k](sigma)    # [B,5,1,1]
-            alpha = hypas[:, 0:1, :, :]
+            # HyPaNet: [B,5,1,1]
+            hypas = self.hypa_list_[k](sigma)
+            alpha = hypas[:, 0:1, :, :]  # [B,1,1,1]
             rho   = hypas[:, 1:2, :, :]
             gamma1 = hypas[:, 2:3, :, :]
             gamma2 = hypas[:, 3:4, :, :]
@@ -334,66 +274,89 @@ class denoise_Net_admm_restormer(nn.Module):
             gamma = [gamma1, gamma2, gamma3]
 
             if k == 0:
-                # 初始步可以沿用原来 S⊙w 逻辑，再加 ΔD
-                w0 = self.dict_adapter(X)
-                X_mod0 = X * w0
-                Y_S0 = self.S(X_mod0)
-                DeltaD0 = self.delta_gen(X)
-                Y_delta0 = apply_DeltaD(X, DeltaD0)
-                Y_hat0 = Y_S0 + 0.1 * Y_delta0
+                # -------- k==0：按 ADMM 初始化逻辑 + S + 动态调制 --------
+                # 动态适配器
+                w = self.dict_adapter(X)      # [B,Cx,1,1]
+                X_mod = X * w                # [B,Cx,H,W]
 
-                temp_back = self.S_T(Y_hat0) - self.S_T(input)
-                X2_img = self.S(temp_back * w0)
-                X1_coef = self.S_T(Y_hat0)
+                # X1 = S(X_mod) （图像域）
+                X1_img = self.S(X_mod)       # [B,Cy,H,W]
+
+                # temp_back = S_T(X1_img) - S_T(input)
+                temp_back = self.S_T(X1_img) - self.S_T(input)  # [B,Cx,H,W]
+
+                # X2_img = S(temp_back * w)  （近似 S+Di 的二次作用）
+                temp_mod = temp_back * w
+                X2_img = self.S(temp_mod)
+
+                # 转回系数域
+                X1_coef = self.S_T(X1_img)   # [B,Cx,H,W]
                 X2_coef = self.S_T(X2_img)
 
                 X_ = X2_coef + rho * X1_coef
                 X = X1_coef - alpha * X_
 
-                rho_map = (1.0 / rho.sqrt()).repeat(1, 1, X.size(2), X.size(3))
+                # Z-step
+                rho_map = (1 / rho.sqrt()).repeat(1, 1, X.size(2), X.size(3))
                 Z, samfeats, enc, dec = self.unet(
                     torch.cat([X, rho_map], dim=1),
                     stage_inter=True
                 )
+
+                # beta-step
                 beta = gamma[1] * X - gamma[2] * Z
 
-                # 中间重构
+                # 中间输出：用 S + 动态调制重构图像
                 w_out = self.dict_adapter(X)
-                Y_S_out = self.S(X * w_out)
-                DeltaD_out = self.delta_gen(X)
-                Y_delta_out = apply_DeltaD(X, DeltaD_out)
-                output = Y_S_out + 0.1 * Y_delta_out
-                preds.append(output)
-            else:
-                X, Z, beta, samfeats, enc, dec = self.body(
-                    X, input, Z, beta, alpha, rho, gamma,
-                    samfeats, enc, dec
-                )
-                w_out = self.dict_adapter(X)
-                Y_S_out = self.S(X * w_out)
-                DeltaD_out = self.delta_gen(X)
-                Y_delta_out = apply_DeltaD(X, DeltaD_out)
-                output = Y_S_out + 0.1 * Y_delta_out
+                Y_S_out = self.S(X)
+                Y_D_out = self.S(X * w_out) - Y_S_out
+                output = Y_S_out + Y_D_out
                 preds.append(output)
 
-        # Final step
-        DeltaD_final = self.delta_gen(X)
+            else:
+                # 其余阶段用 BodyNet（内部已用 S + 动态适配器）
+                X, Z, beta, samfeats, enc, dec = self.body(
+                    X, input, Z, beta, alpha, rho,
+                    gamma, samfeats, enc, dec
+                )
+
+                w_out = self.dict_adapter(X)
+                Y_S_out = self.S(X)
+                Y_D_out = self.S(X * w_out) - Y_S_out
+                output = Y_S_out + Y_D_out
+                preds.append(output)
+
+        # -------- FINAL STEP：再做一次 X 更新 + 重构 --------
         w_final = self.dict_adapter(X)
 
+        # temp = S(X * w_final) - input
         Y_S_final = self.S(X * w_final)
-        Y_delta_final = apply_DeltaD(X, DeltaD_final)
-        Y_hat_final = Y_S_final + 0.1 * Y_delta_final
+        temp = Y_S_final - input          # [B,Cy,H,W]
 
-        temp = Y_hat_final - input
-        X_1 = self.S_T(temp) + apply_DeltaD_T(0.1 * temp, DeltaD_final)
+        # X_1 = S_T(temp) * (1 + w_final) （简洁起见，用同一 w 调制）
+        X_1 = self.S_T(temp) * (1.0 + w_final)
+
+        # X_2 = rho * (X - Z - beta)
         X_2 = rho * (X - Z - beta)
         X_out = X - alpha * (X_1 + X_2)
 
+        # 最终重构
         w_out = self.dict_adapter(X_out)
-        Y_S_out = self.S(X_out * w_out)
-        DeltaD_out = self.delta_gen(X_out)
-        Y_delta_out = apply_DeltaD(X_out, DeltaD_out)
-        output = Y_S_out + 0.1 * Y_delta_out
+        Y_S_out = self.S(X_out)
+        Y_D_out = self.S(X_out * w_out) - Y_S_out
+        output = Y_S_out + Y_D_out
         preds.append(output)
 
         return output, preds
+
+
+##########################################################################
+# ST（保留接口，不在当前结构中使用）
+##########################################################################
+
+class ST(nn.Module):
+    def __init__(self):
+        super(ST, self).__init__()
+
+    def forward(self, x, t, samfeats=None, enc_in=None, dec_in=None):
+        return x.sign() * F.relu(x.abs() - t), samfeats, enc_in, dec_in
