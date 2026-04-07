@@ -1,4 +1,4 @@
-26-04-03 15:30:31.259 :   task: test
+26-04-07 17:16:46.882 :   task: test
   log_path: ./log
   gpu_ids: [0, 1, 2, 3]
   batch_size: 1

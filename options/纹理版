@@ -1,0 +1,138 @@
+train
+{
+  "task": "train",
+  "gpu_ids": [0],
+
+  "log_path": "./log",
+  "model_save": "./model_save",
+  "pretained_path": {
+    "index": false,
+    "path":"./model_save/model_best1.pth"
+  },
+  "batch_size":4,
+  "nc": [16, 1],
+  "patch_size": [128, 128],
+  "stride_size": [16, 16],
+  "atoms": 50,
+  "d_size": 3,            
+  "max_epoch": 1000,        
+  "stage": 3,
+  "lr": 1e-4,
+  "loss_function_index": 1, 
+  "n_channels": 1,
+  "train": {
+      "sigma": [
+        15,
+        50
+      ],
+      "dataroot_H": "./dataset/gray_train_all",
+      "H_size": 128, 
+      "n_channels": 1
+  },
+  "valid": {
+      "sigma": [
+        15,
+        25,
+        50
+      ],
+      "dataroot_H": "./dataset/gray_test",
+      "n_channels": 1
+  }
+}
+
+
+test
+{
+  "task": "test",
+  "log_path": "./log",
+  "gpu_ids": [0,1,2,3],
+  "batch_size": 1, 
+  "nc": [16, 1],
+  "patch_size": [128, 128], 
+  "stride_size": [16, 16],
+  "d_size": 3,           
+  "max_epoch": 80, 
+  "stage": 3,
+  "scale": 3,
+  "n_channels": 1,
+  "pretained_path": "./model_save/model_best.pth",
+  "test": {
+      "sigma": [15,25,50],
+      "dataroot_H":  "./dataset/gray_test" ,//"./test_data/color"  "../dataset/color_test"
+      "n_channels": 1
+  }
+}
+
+
+
+
+
+trainws纹理版
+{
+  "task": "train",
+  "gpu_ids": [0],
+
+  "log_path": "./log",
+  "model_save": "./model_save_enhanced",
+  "pretained_path": {
+    "index": false,
+    "path": "./model_save_enhanced/model_best.pth"
+  },
+  "batch_size": 8,
+  "nc": [16, 1],
+  "patch_size": [128, 128],
+  "stride_size": [16, 16],
+  "atoms": 50,
+  "d_size": 3,
+  "max_epoch": 300,
+  "stage": 4,
+  "lr": 1e-4,
+  "loss_function_index": 1,
+  "n_channels": 1,
+  
+  "🔥 新增：增强版模型配置": {},
+  "use_texture_loss": true,
+  "texture_loss_weight": 0.1,
+  "use_gabor": true,
+  "use_periodic": true,
+  
+  "train": {
+    "sigma": [15, 25, 50],
+    "dataroot_H": "./dataset/gray_train_all",
+    "H_size": 128,
+    "n_channels": 1
+  },
+  "valid": {
+    "sigma": [15, 25, 50],
+    "dataroot_H": "./dataset/gray_test",
+    "n_channels": 1
+  }
+}
+
+
+
+
+
+testws纹理版
+{
+  "task": "test",
+  "log_path": "./log",
+  "gpu_ids": [0],
+  "batch_size": 1,
+  "nc": [16, 1],
+  "patch_size": [128, 128],
+  "stride_size": [16, 16],
+  "d_size": 3,
+  "max_epoch": 300,
+  "stage": 4,
+  "scale": 3,
+  "n_channels": 1,
+  
+  "pretained_path": "./model_save_enhanced/model_best.pth",
+  
+  "test": {
+    "sigma": [15, 25, 50],
+    "dataroot_H": "./dataset/gray_test",
+    "n_channels": 1
+  }
+}

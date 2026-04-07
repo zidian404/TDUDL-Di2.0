@@ -7,6 +7,7 @@ from typing import Any, List, Tuple
 from Net.restormer_arch import Restormer11
 
 
+#k==0和else和原代码逻辑一致，z的更新加上了β，最后改成了X - Z  + beta
 ##########################################################################
 # Basic modules
 ##########################################################################

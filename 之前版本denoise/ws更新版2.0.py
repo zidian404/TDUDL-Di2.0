@@ -177,9 +177,10 @@ class BodyNet(nn.Module):
         X_out = X - alpha * (grad + rho * X_term)
 
         # ---- Z-step（Restormer）----
+        Z_input = X_out + beta
         rho_ = (1 / rho.sqrt()).repeat(1, 1, X_out.size(2), X_out.size(3))
         Z, samfeats, enc_, dec_ = self.unet(
-            torch.cat([X_out, rho_], dim=1),
+            torch.cat([Z_input, rho_], dim=1),
             samfeats, enc, dec, stage_inter=True
         )
 
@@ -297,9 +298,10 @@ class denoise_Net_admm_restormer(nn.Module):
                 X = X1_coef - alpha * X_
 
                 # Z-step
+                Z_input = X + beta
                 rho_map = (1 / rho.sqrt()).repeat(1, 1, X.size(2), X.size(3))
                 Z, samfeats, enc, dec = self.unet(
-                    torch.cat([X, rho_map], dim=1),
+                    torch.cat([Z_input, rho_map], dim=1),
                     stage_inter=True
                 )
 

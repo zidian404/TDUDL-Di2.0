@@ -15,7 +15,7 @@
   "atoms": 50,
   "d_size": 3,            
   "max_epoch": 1000,        
-  "stage": 1,
+  "stage": 3,
   "lr": 1e-4,
   "loss_function_index": 1, 
   "n_channels": 1,
