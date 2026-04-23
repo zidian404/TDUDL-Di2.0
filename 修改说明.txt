@@ -21,3 +21,10 @@ denoise
 2.Y-Di
 3.Y+X-Di
 
+三修WS
+1.denoise
+2.train
+3.option
+4.admm数据集处理
+5.image通道维度
+

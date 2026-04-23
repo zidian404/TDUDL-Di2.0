@@ -6,35 +6,39 @@
   "model_save": "./model_save",
   "pretained_path": {
     "index": false,
-    "path":"./model_save/model_best1.pth"
+    "path": "./model_save/model_best_mix.pth"
   },
-  "batch_size":4,
+
+  "batch_size": 4,
   "nc": [16, 1],
   "patch_size": [128, 128],
   "stride_size": [16, 16],
   "atoms": 50,
-  "d_size": 3,            
-  "max_epoch": 1000,        
-  "stage": 3,
+  "d_size": 3,
+  "max_epoch": 1000,
+  "stage": 1,
   "lr": 1e-4,
-  "loss_function_index": 1, 
+  "loss_function_index": 1,
   "n_channels": 1,
+
   "train": {
-      "sigma": [
-        15,
-        50
-      ],
-      "dataroot_H": "./dataset/gray_train_all",
-      "H_size": 128, 
-      "n_channels": 1
+    "dataroot_H": "./dataset/gray_train_all",
+    "H_size": 128,
+    "n_channels": 1,
+
+    "blur_type": "motion_defocus_mix",
+    "motion_kernel_size_list": [3, 5, 7, 9],
+    "motion_angle_list": [90],
+    "defocus_radius_list": [0, 1, 2, 3]
   },
+
   "valid": {
-      "sigma": [
-        15,
-        25,
-        50
-      ],
-      "dataroot_H": "./dataset/gray_test",
-      "n_channels": 1
+    "dataroot_H": "./dataset/gray_test",
+    "n_channels": 1,
+
+    "blur_type": "motion_defocus_mix",
+    "motion_kernel_size_list": [5, 9],
+    "motion_angle_list": [90],
+    "defocus_radius_list": [0, 2, 3]
   }
 }

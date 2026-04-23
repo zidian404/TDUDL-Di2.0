@@ -1,0 +1,7 @@
+Total samples: 240
+PSNR mean: 74.047565
+PSNR min : 72.235584
+PSNR max : 75.474161
+SSIM mean: 1.000000
+SSIM min : 0.999998
+SSIM max : 1.000000
