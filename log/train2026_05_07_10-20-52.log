@@ -1,0 +1,42 @@
+26-05-07 10:20:52.733 :   task: train
+  gpu_ids: [0]
+  log_path: ./log
+  model_save: ./model_save
+  pretained_path:[
+    index: False
+    path: ./model_save/model_best1.pth
+  ]
+  batch_size: 4
+  nc: [16, 1]
+  patch_size: [128, 128]
+  stride_size: [16, 16]
+  atoms: 50
+  d_size: 3
+  max_epoch: 1000
+  stage: 3
+  lr: 0.0001
+  loss_function_index: 1
+  n_channels: 1
+  train:[
+    sigma: [0]
+    dataroot_H: ./dataset/gray_train_all
+    H_size: 128
+    n_channels: 1
+  ]
+  valid:[
+    sigma: [0]
+    dataroot_H: ./dataset/gray_valid_all
+    n_channels: 1
+  ]
+  opt_path: ./options/train_options.json
+  is_train: True
+  scale: 1
+
+26-05-07 10:20:53.753 : Number of parameter: 3.26M
+26-05-07 10:20:53.753 : start training...
+26-05-07 10:23:36.980 : epoch:[1/1000], 平均loss: 0.0960
+26-05-07 10:26:19.877 : epoch:[2/1000], 平均loss: 0.0058
+26-05-07 10:29:00.753 : epoch:[3/1000], 平均loss: 0.0036
+26-05-07 10:31:39.851 : epoch:[4/1000], 平均loss: 0.0026
+26-05-07 10:34:19.293 : epoch:[5/1000], 平均loss: 0.0021
+26-05-07 10:34:23.362 : 训练出错，进度已保存: list index out of range

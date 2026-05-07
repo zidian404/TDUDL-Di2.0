@@ -1,0 +1,232 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+from Net.restormer_arch import Restormer11
+
+
+def default_conv(in_channels, out_channels, kernel_size, stride=1, bias=True):
+    return nn.Conv2d(
+        in_channels, out_channels, kernel_size,
+        padding=kernel_size // 2, stride=stride, bias=bias
+    )
+
+
+class HeadNet(nn.Module):
+    def __init__(self, in_channels: int, feat_channels: int, k_size: int = 3):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels + 1, 32, k_size, padding=k_size // 2, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, feat_channels, 3, padding=1, bias=False)
+        )
+
+    def forward(self, y, sigma):
+        sigma_map = sigma.repeat(1, 1, y.size(2), y.size(3))
+        return self.head(torch.cat([y, sigma_map], dim=1))
+
+
+class HyPaNet(nn.Module):
+    def __init__(self, in_nc: int = 1, nc: int = 32, out_nc: int = 3):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_nc, nc, 1, padding=0, bias=True),
+            nn.Sigmoid(),
+            nn.Conv2d(nc, out_nc, 1, padding=0, bias=True),
+            nn.Softplus()
+        )
+
+    def forward(self, x: Tensor):
+        x = (x - 0.098) / 0.0566
+        return self.mlp(x) + 1e-6
+
+
+class AtomBank(nn.Module):
+    """
+    全局共享原子库，不再按样本生成字典
+    atoms: [N, C_img, C_coef, k, k]
+    """
+    def __init__(self, n_atoms: int, img_channels: int, coef_channels: int, k_size: int):
+        super().__init__()
+        self.n_atoms = n_atoms
+        self.img_channels = img_channels
+        self.coef_channels = coef_channels
+        self.k_size = k_size
+        self.atoms = nn.Parameter(
+            torch.randn(n_atoms, img_channels, coef_channels, k_size, k_size) * 0.02
+        )
+
+    def forward(self):
+        atoms = self.atoms.view(self.n_atoms, -1)
+        atoms = F.normalize(atoms, p=2, dim=1)
+        atoms = atoms.view(self.n_atoms, self.img_channels, self.coef_channels, self.k_size, self.k_size)
+        return atoms
+
+
+class GateNet(nn.Module):
+    """
+    只输出原子权重，不生成字典
+    """
+    def __init__(self, in_channels: int, n_atoms: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(32, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, n_atoms)
+        )
+
+    def forward(self, x, topk=None, temperature=1.0):
+        b = x.size(0)
+        feat = self.net(x).view(b, -1)
+        logits = self.fc(feat) / temperature
+        if topk is not None and topk < logits.size(1):
+            vals, idx = torch.topk(logits, topk, dim=1)
+            masked = torch.full_like(logits, -1e9)
+            masked.scatter_(1, idx, vals)
+            gate = torch.softmax(masked, dim=1)
+        else:
+            gate = torch.softmax(logits, dim=1)
+        return gate
+
+
+def synthesis_by_atoms(X, atoms, gates):
+    """
+    X:     [B, C_coef, H, W]
+    atoms: [N, C_img, C_coef, k, k]
+    gates: [B, N]
+    """
+    B, C_coef, H, W = X.shape
+    N, C_img, _, k, _ = atoms.shape
+    outs = []
+    for b in range(B):
+        x_b = X[b:b+1]
+        y_b = 0.0
+        for n in range(N):
+            y_n = F.conv2d(x_b, atoms[n], padding=k // 2)
+            y_b = y_b + gates[b, n] * y_n
+        outs.append(y_b)
+    return torch.cat(outs, dim=0)
+
+
+def adjoint_by_atoms(Y, atoms, gates):
+    """
+    Y:     [B, C_img, H, W]
+    atoms: [N, C_img, C_coef, k, k]
+    gates: [B, N]
+    """
+    B, C_img, H, W = Y.shape
+    N, _, C_coef, k, _ = atoms.shape
+    outs = []
+    for b in range(B):
+        y_b = Y[b:b+1]
+        x_b = 0.0
+        for n in range(N):
+            atom_t = atoms[n].permute(1, 0, 2, 3).contiguous()
+            x_n = F.conv2d(y_b, atom_t, padding=k // 2)
+            x_b = x_b + gates[b, n] * x_n
+        outs.append(x_b)
+    return torch.cat(outs, dim=0)
+
+
+class denoise_Net_admm_restormer(nn.Module):
+    def __init__(self, opt):
+        super().__init__()
+        self.n_channels = opt["n_channels"]
+        self.d_size = opt["d_size"]
+        self.stage = opt["stage"]
+        self.m_channels = opt.get("m_channels", 8)
+        self.n_atoms = opt.get("n_atoms", 16)
+        self.topk_atoms = opt.get("topk_atoms", 2)
+
+        self.headnet = HeadNet(self.n_channels, self.n_channels, 3)
+        self.analysis = default_conv(self.n_channels, self.m_channels, self.d_size)
+
+        self.unet = Restormer11(
+            inp_channels=self.m_channels + 1,
+            out_channels=self.m_channels,
+            dim=self.m_channels
+        )
+
+        self.atom_bank = AtomBank(
+            n_atoms=self.n_atoms,
+            img_channels=self.n_channels,
+            coef_channels=self.m_channels,
+            k_size=self.d_size
+        )
+        self.gate_net = GateNet(self.n_channels, self.n_atoms, hidden=64)
+        self.hypa_list = nn.ModuleList([HyPaNet(in_nc=1, out_nc=3) for _ in range(self.stage)])
+        self.soft_thr = nn.Softshrink()
+
+    def atom_orth_loss(self):
+        atoms = self.atom_bank().view(self.n_atoms, -1)
+        gram = atoms @ atoms.t()
+        I = torch.eye(self.n_atoms, device=gram.device, dtype=gram.dtype)
+        return ((gram - I) ** 2).mean()
+
+    def gate_entropy_loss(self, gates):
+        return -(gates * torch.log(gates + 1e-8)).sum(dim=1).mean()
+
+    def forward(self, input, sigma, return_sparse=False, return_atom_weights=False):
+        if sigma.dim() == 1:
+            sigma = sigma.unsqueeze(1)
+        sigma = sigma.view(sigma.size(0), 1, 1, 1).to(input.device)
+
+        gates = self.gate_net(input, topk=self.topk_atoms, temperature=1.0)
+        atoms = self.atom_bank()
+
+        feat0 = self.headnet(input, sigma)
+        X = self.analysis(feat0)
+
+        preds = []
+
+        for k in range(self.stage):
+            hyp = self.hypa_list[k](sigma)
+            alpha = hyp[:, 0:1]
+            thresh = hyp[:, 1:2]
+            temp = hyp[:, 2:3]
+
+            Yk = synthesis_by_atoms(X, atoms, gates)
+            res = Yk - input
+            grad = adjoint_by_atoms(res, atoms, gates)
+
+            alpha_map = alpha.repeat(1, 1, X.size(2), X.size(3))
+            X = X - alpha_map * grad
+
+            thresh_map = thresh.repeat(1, 1, X.size(2), X.size(3))
+            X = torch.sign(X) * F.relu(torch.abs(X) - thresh_map)
+
+            rho_map = temp.repeat(1, 1, X.size(2), X.size(3))
+            tr_in = torch.cat([X, rho_map], dim=1)
+            tr_out = self.unet(tr_in, stage_inter=True)
+            if isinstance(tr_out, (list, tuple)):
+                X_prior = tr_out[0]
+            else:
+                X_prior = tr_out
+
+            X = 0.85 * X + 0.15 * X_prior
+            preds.append(synthesis_by_atoms(X, atoms, gates))
+
+        final_out = synthesis_by_atoms(X, atoms, gates)
+        final_out = torch.clamp(final_out, 0.0, 1.0)
+        preds.append(final_out)
+
+        results = [final_out, preds]
+        if return_sparse:
+            results.append(X)
+        if return_atom_weights:
+            results.append(gates)
+
+        if len(results) == 2:
+            return results[0], results[1]
+        elif len(results) == 3:
+            return results[0], results[1], results[2]
+        else:
+            return results[0], results[1], results[2], results[3]

@@ -1,0 +1,290 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+from typing import Any, List, Tuple
+
+from Net.restormer_arch import Restormer11 
+
+##########################################################################
+# 1. 基础卷积工具函数
+##########################################################################
+
+def conv(in_channels, out_channels, kernel_size, bias=False, stride=1):
+    return nn.Conv2d(
+        in_channels, out_channels, kernel_size,
+        padding=(kernel_size // 2), bias=bias, stride=(stride, stride))
+
+def default_conv(in_channels, out_channels, kernel_size, stride=1, bias=True):
+    return nn.Conv2d(
+        in_channels, out_channels, kernel_size,
+        padding=(kernel_size // 2), stride=(stride, stride), bias=bias)
+
+def conv_down(in_chn, out_chn, kernel_size, stride=2, bias=False):
+    return nn.Conv2d(in_chn, out_chn, kernel_size, stride=stride, padding=(kernel_size - 1) // 2, bias=bias)
+
+def conv_up(in_chn, out_chn, kernel_size, stride=2, bias=False):
+    return nn.ConvTranspose2d(in_chn, out_chn, kernel_size, stride=stride, 
+                              padding=(kernel_size - 1) // 2, output_padding=stride-1, bias=bias)
+
+class ST(nn.Module):
+    def __init__(self):
+        super(ST, self).__init__()
+    def forward(self, x, t, samfeats=None, enc_in=None, dec_in=None):
+        return x.sign() * F.relu(x.abs() - t), samfeats, enc_in, dec_in
+
+##########################################################################
+# 2. 矩阵运算算子
+##########################################################################
+
+def apply_Di(X, D_i):
+    B, Cx, H, W = X.shape
+    _, Cy, _, k, _ = D_i.shape
+    patches = F.unfold(X, kernel_size=k, padding=k // 2)
+    patches = patches.transpose(1, 2)
+    K_flat = D_i.view(B, Cy, Cx * k * k)
+    Y_flat = torch.bmm(K_flat, patches.transpose(1, 2))
+    return F.fold(Y_flat, output_size=(H, W), kernel_size=1)
+
+def apply_Di_T(Y, D_i):
+    B, Cy, H, W = Y.shape
+    _, _, Cx, k, _ = D_i.shape
+    patches = F.unfold(Y, kernel_size=k, padding=k // 2)
+    patches = patches.transpose(1, 2)
+    K_T = D_i.permute(0, 2, 1, 3, 4).contiguous()
+    K_T_flat = K_T.view(B, Cx, Cy * k * k)
+    X_flat = torch.bmm(K_T_flat, patches.transpose(1, 2))
+    return F.fold(X_flat, output_size=(H, W), kernel_size=1)
+
+##########################################################################
+# 3. 子网络定义
+##########################################################################
+
+class HeadNet(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, d_size: int):
+        super(HeadNet, self).__init__()
+        self.head_x = nn.Sequential(
+            nn.Conv2d(in_channels + 1, 64, d_size, padding=(d_size - 1) // 2, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, out_channels, 3, padding=1, bias=False))
+
+    def forward(self, y, sigma):
+        sigma = sigma.repeat(1, 1, y.size(2), y.size(3))
+        return self.head_x(torch.cat([y, sigma], dim=1))
+
+class HyPaNet(nn.Module):
+    def __init__(self, in_nc: int = 1, nc: int = 64, out_nc: int = 5):
+        super(HyPaNet, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_nc, nc, 1, padding=0, bias=True), nn.Sigmoid(),
+            nn.Conv2d(nc, out_nc, 1, padding=0, bias=True), nn.Softplus())
+
+    def forward(self, x: Tensor):
+        x = (x - 0.098) / 0.0566
+        return self.mlp(x) + 1e-6
+
+class DiGenerator(nn.Module):
+    def __init__(self, in_channels, out_channels, k_size, m_channels):
+        super(DiGenerator, self).__init__()
+        self.out_c, self.in_c, self.k = out_channels, m_channels, k_size
+        self.extractor = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True))
+        self.sa = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3, bias=False),
+            nn.Sigmoid())
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(32, 64), nn.ReLU(inplace=True),
+            nn.Linear(64, out_channels * m_channels * k_size * k_size))
+
+    def forward(self, y):
+        b = y.size(0)
+        feat = self.extractor(y)
+        avg_out = torch.mean(feat, dim=1, keepdim=True)
+        max_out, _ = torch.max(feat, dim=1, keepdim=True)
+        attn = self.sa(torch.cat([avg_out, max_out], dim=1))
+        pooled = self.global_pool(feat * attn).view(b, -1)
+        return self.mlp(pooled).view(b, self.out_c, self.in_c, self.k, self.k)
+
+##########################################################################
+# 4. BodyNet
+##########################################################################
+
+class BodyNet(nn.Module):
+    def __init__(self, unet, S, S_T):
+        super(BodyNet, self).__init__()
+        self.unet = unet
+        self.S, self.S_T = S, S_T
+
+    def forward(self, X_in, Y, Z, beta, alpha, rho, gamma, Di_batch, samfeats, enc, dec):
+        res = (self.S(X_in) + apply_Di(X_in, Di_batch)) - Y
+        grad = self.S_T(res) + apply_Di_T(res, Di_batch)
+        X_out = X_in - alpha * (grad + rho * (X_in - Z + beta))
+        rho_map = (1 / rho.sqrt()).repeat(1, 1, X_out.size(2), X_out.size(3))
+        Z, samfeats, enc_, dec_ = self.unet(torch.cat([X_out, rho_map], dim=1), samfeats, enc, dec, stage_inter=True)
+        beta = gamma[0] * beta + gamma[1] * X_out - gamma[2] * Z
+        return X_out, Z, beta, samfeats, enc_, dec_
+
+##########################################################################
+# 5. 纹理重构专用损失函数
+##########################################################################
+
+class TextureReconstructionLoss(nn.Module):
+    """
+    纹理重构损失：只对正常纹理区域进行重构，抑制疵点区域的学习
+    """
+    def __init__(self, texture_weight=1.0, edge_weight=0.1):
+        super().__init__()
+        self.texture_weight = texture_weight
+        self.edge_weight = edge_weight
+        self.mse = nn.MSELoss()
+        self.l1 = nn.L1Loss()
+        
+    def forward(self, output, target, anomaly_mask=None):
+        """
+        Args:
+            output: 模型输出
+            target: 目标图像（输入图像）
+            anomaly_mask: 疵点掩码，1表示疵点区域，0表示正常区域
+        """
+        if anomaly_mask is not None:
+            # 正常区域掩码（与疵点区域相反）
+            normal_mask = 1 - anomaly_mask
+            
+            # 计算正常区域的面积，用于归一化
+            normal_area = normal_mask.sum() + 1e-8
+            anomaly_area = anomaly_mask.sum() + 1e-8
+            
+            # 1. 纹理区域重构损失（正常区域）
+            texture_loss = self.mse(output * normal_mask, target * normal_mask) * (output.shape[2] * output.shape[3] / normal_area)
+            
+            # 2. 疵点区域抑制损失：让输出接近输入（即不改变疵点区域）
+            anomaly_suppress_loss = self.l1(output * anomaly_mask, target * anomaly_mask) * (output.shape[2] * output.shape[3] / anomaly_area)
+            
+            # 3. 边缘平滑损失（可选）
+            edge_loss = self._edge_loss(output * normal_mask, target * normal_mask)
+            
+            total_loss = (self.texture_weight * texture_loss + 
+                         anomaly_suppress_loss + 
+                         self.edge_weight * edge_loss)
+            
+            return total_loss
+        else:
+            # 没有掩码时使用标准MSE
+            return self.mse(output, target)
+    
+    def _edge_loss(self, output, target):
+        """计算边缘损失，保持纹理边缘清晰"""
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=output.device).float().view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=output.device).float().view(1, 1, 3, 3)
+        
+        if output.shape[1] > 1:
+            sobel_x = sobel_x.repeat(1, output.shape[1], 1, 1)
+            sobel_y = sobel_y.repeat(1, output.shape[1], 1, 1)
+        
+        output_grad_x = F.conv2d(output, sobel_x, padding=1, groups=output.shape[1])
+        output_grad_y = F.conv2d(output, sobel_y, padding=1, groups=output.shape[1])
+        target_grad_x = F.conv2d(target, sobel_x, padding=1, groups=target.shape[1])
+        target_grad_y = F.conv2d(target, sobel_y, padding=1, groups=target.shape[1])
+        
+        return self.l1(output_grad_x, target_grad_x) + self.l1(output_grad_y, target_grad_y)
+
+##########################################################################
+# 6. 主模型：纹理重构专用
+##########################################################################
+
+class denoise_Net_admm_restormer(nn.Module):
+    """
+    纹理重构网络：只学习正常纹理，不学习疵点
+    通过自适应掩码机制，自动识别并忽略疵点区域
+    """
+    def __init__(self, opt):
+        super(denoise_Net_admm_restormer, self).__init__()  # 修正：类名匹配
+        self.n_channels = opt["n_channels"]
+        self.d_size = opt["d_size"]
+        self.stage = opt["stage"]
+        self.m_channels = 16
+        
+        # 自适应残差阈值（用于检测异常）
+        self.anomaly_threshold = nn.Parameter(torch.tensor(0.05))
+        
+        # 原有网络组件
+        self.headnet = HeadNet(self.n_channels, self.n_channels, 3)
+        self.unet = Restormer11(inp_channels=self.m_channels+1, out_channels=self.m_channels, dim=self.m_channels)
+        
+        self.S = default_conv(self.m_channels, self.n_channels, self.d_size)
+        self.S_T = default_conv(self.n_channels, self.m_channels, self.d_size)
+        
+        self.di_gen = DiGenerator(self.n_channels, self.n_channels, self.d_size, self.m_channels)
+        self.body = BodyNet(self.unet, self.S, self.S_T)
+        self.hypa_list = nn.ModuleList([HyPaNet(in_nc=1, out_nc=5) for _ in range(self.stage)])
+        
+        # 自适应异常检测模块
+        self.anomaly_detector = nn.Sequential(
+            nn.Conv2d(self.n_channels, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 3, padding=1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, input, sigma, return_masks=False):
+        """
+        Args:
+            input: 输入图像 [B, C, H, W]
+            sigma: 噪声水平参数
+            return_masks: 是否返回检测到的异常掩码
+        Returns:
+            训练模式: (output, preds)
+            推理模式: (output, preds, masks) 如果 return_masks=True
+        """
+        Di_batch = self.di_gen(input)
+        sigma = sigma.view(sigma.size(0), 1, 1, 1).to(input.device)
+        X = self.S_T(self.headnet(input, sigma))
+        
+        preds = []
+        Z = torch.zeros_like(X)
+        beta = torch.zeros_like(X)
+        samfeats = enc = dec = None
+        
+        # ADMM迭代
+        for k in range(self.stage):
+            hypas = self.hypa_list[k](sigma)
+            alpha, rho = hypas[:, 0:1], hypas[:, 1:2]
+            gamma = [hypas[:, 2:3], hypas[:, 3:4], hypas[:, 4:5]]
+            
+            if k == 0:
+                X1_img = self.S(X) + apply_Di(X, Di_batch)
+                temp = (self.S_T(X1_img) + apply_Di_T(input, Di_batch)) - self.S_T(input)
+                X_ = self.S_T(self.S(temp) + apply_Di(temp, Di_batch)) + rho * self.S_T(X1_img)
+                X = self.S_T(X1_img) - alpha * X_
+                rho_m = (1 / rho.sqrt()).repeat(1, 1, X.size(2), X.size(3))
+                Z, samfeats, enc, dec = self.unet(torch.cat([X, rho_m], dim=1), stage_inter=True)
+                beta = gamma[1] * X - gamma[2] * Z
+            else:
+                X, Z, beta, samfeats, enc, dec = self.body(
+                    X, input, Z, beta, alpha, rho, gamma, Di_batch, samfeats, enc, dec)
+            
+            preds.append(self.S(X) + apply_Di(X, Di_batch))
+        
+        # Final step
+        res_f = (self.S(X) + apply_Di(X, Di_batch)) - input
+        grad_f = self.S_T(res_f) + apply_Di_T(res_f, Di_batch)
+        X_out = X - alpha * (grad_f + rho * (X - Z - beta))
+        
+        final_out = self.S(X_out) + apply_Di(X_out, Di_batch)
+        preds.append(final_out)
+        
+        # 训练代码期望返回 (output, preds)
+        if return_masks:
+            reconstruction_diff = torch.abs(final_out - input)
+            detected_anomaly = self.anomaly_detector(reconstruction_diff)
+            anomaly_mask_pred = (detected_anomaly > torch.sigmoid(self.anomaly_threshold)).float()
+            return final_out, preds, detected_anomaly, anomaly_mask_pred
+        else:
+            return final_out, preds

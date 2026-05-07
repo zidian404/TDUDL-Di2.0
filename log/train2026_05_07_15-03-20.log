@@ -1,0 +1,44 @@
+26-05-07 15:03:20.285 :   task: train
+  gpu_ids: [0]
+  log_path: ./log
+  model_save: ./model_save
+  pretained_path:[
+    index: False
+    path: ./model_save/model_best1.pth
+  ]
+  batch_size: 4
+  nc: [16, 1]
+  patch_size: [128, 128]
+  stride_size: [16, 16]
+  atoms: 50
+  d_size: 3
+  max_epoch: 1000
+  stage: 3
+  lr: 0.0001
+  loss_function_index: 1
+  n_channels: 1
+  train:[
+    sigma: [0]
+    dataroot_H: ./dataset/gray_train_all
+    H_size: 128
+    n_channels: 1
+  ]
+  valid:[
+    sigma: [0]
+    dataroot_H: ./dataset/gray_valid_all
+    n_channels: 1
+  ]
+  opt_path: ./options/train_options.json
+  is_train: True
+  scale: 1
+
+26-05-07 15:03:20.292 : 训练集大小: 1120
+26-05-07 15:03:20.292 : 验证集数量: 240
+26-05-07 15:03:21.332 : Number of parameter: 3.26M
+26-05-07 15:03:21.332 : start training...
+26-05-07 15:06:00.953 : epoch:[1/1000], 平均loss: 0.057067
+26-05-07 15:08:39.572 : epoch:[2/1000], 平均loss: 0.006986
+26-05-07 15:11:17.667 : epoch:[3/1000], 平均loss: 0.003790
+26-05-07 15:13:58.965 : epoch:[4/1000], 平均loss: 0.003039
+26-05-07 15:16:40.289 : epoch:[5/1000], 平均loss: 0.002439
+26-05-07 15:16:40.690 : 训练出错: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!

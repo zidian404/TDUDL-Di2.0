@@ -1,15 +1,19 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import torch.utils.data as data
-import torch
+import torch, cv2
 import time
 import os
 import logging
+from torchsummary import summary
 from glob import glob
 from prettytable import PrettyTable
 from torch import cuda
 import numpy as np
 import random
-
+import copy
+from thop import profile
+from scipy import linalg
+from collections import OrderedDict
 import Net.denoise_net as net
 from utils.dataset_admm import get_data
 import utils.utils_option as option
@@ -17,205 +21,234 @@ from utils.dataset_admm import dataset_admm_denose
 import utils.utils_image as image
 from utils import utils_logger
 
-
-def safe_forward(model, img_L, blur_level=None):
-    if torch.isnan(img_L).any() or torch.isinf(img_L).any():
-        img_L = torch.nan_to_num(img_L, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    if blur_level is None:
-        blur_level = torch.full((img_L.size(0), 1), 0.01, device=img_L.device, dtype=img_L.dtype)
-    if blur_level.dim() == 1:
-        blur_level = blur_level.unsqueeze(1)
-    blur_level = blur_level.to(dtype=img_L.dtype)
-
+# ------------------------
+# 辅助函数: 安全模型前向传播
+# ------------------------
+def safe_forward(model, img_L, noise_level):
+    """安全的模型前向传播，包含NaN/Inf检查"""
     with torch.no_grad():
-        test_out, aux = model(img_L, blur_level)
-
+        if torch.isnan(img_L).any() or torch.isinf(img_L).any():
+            img_L = torch.nan_to_num(img_L, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+        if torch.isnan(noise_level).any() or torch.isinf(noise_level).any():
+            noise_level = torch.nan_to_num(noise_level, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+        test_out, aaa = model(img_L, noise_level)
+        
         if torch.isnan(test_out).any() or torch.isinf(test_out).any():
             test_out = torch.nan_to_num(test_out, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+        return test_out, aaa
 
-        return test_out, aux
-
-
+# ------------------------
+# 主函数
+# ------------------------
 if __name__ == '__main__':
-    gpus = ','.join([str(i) for i in [0]])
+
+    gpus = ','.join([str(i) for i in [0, 1, 2, 3]])
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
-
+    device_ids = [i for i in range(torch.cuda.device_count())]
     if torch.cuda.device_count() > 0:
         print(f"\n\nLet's use {torch.cuda.device_count()} GPU!\n\n")
-
-    seed_ = 1234
+    
+    seed_=1234
     random.seed(seed_)
     np.random.seed(seed_)
     torch.manual_seed(seed_)
     cuda.manual_seed_all(seed_)
-
+    
+    # ------------------------
+    #       option_setting
+    # ------------------------
     json_path = "./options/test_options.json"
     opt = option.parse(json_path, is_train=False)
-
-    logger_name = 'test' + time.strftime('%Y_%m_%d_%H-%M-%S', time.localtime())
+    
+    # logger
+    logger_name = 'test'+time.strftime('%Y_%m_%d_%H-%M-%S', time.localtime())
     utils_logger.logger_info(
         logger_name, os.path.join(opt['log_path'], logger_name + '.log'))
     logger = logging.getLogger(logger_name)
     logger.info(option.dict2str(opt))
 
+    # -------------------------
+    #           dataset
+    # ------------------------
+    # --- 检查点 1: 文件名列表 ---
     names = []
     test_data_path = opt['test']['dataroot_H']
     for name in sorted(glob(os.path.join(test_data_path, '*'))):
         names.append(os.path.basename(name))
     print(f"Found {len(names)} test images in path: {test_data_path}")
-
+    
     print("Loading test datasets...")
     test_set = get_data(opt, 'test')
-    print(f"Loaded {len(test_set)} test sets")
-
-    test_loaders: List[data.DataLoader] = []
-    for valid in test_set:
-        loader = data.DataLoader(
-            dataset=valid,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            drop_last=False,
-            pin_memory=True
-        )
+    # --- 检查点 2: 数据集数量 ---
+    print(f"Loaded {len(test_set)} test sets (one for each image * sigma combination)")
+    
+    test_loaders: List[data.DataLoader[dataset_admm_denose]] = []
+    for i, valid in enumerate(test_set):
+        loader = data.DataLoader(dataset=valid, batch_size=1, shuffle=False, num_workers=4, drop_last=True, pin_memory=True)
         test_loaders.append(loader)
-
+    
     print(f"Total {len(test_loaders)} DataLoaders created.")
 
+    # -------------------------
+    #           model
+    # ------------------------
     print("Loading model...")
     model = net.denoise_Net_admm_restormer(opt)
-    pretrained_path = opt["pretained_path"]
-
-    if not os.path.exists(pretrained_path):
-        print(f"ERROR: Model file not found: {pretrained_path}")
+    pretained_path = opt["pretained_path"]
+    
+    if not os.path.exists(pretained_path):
+        print(f"ERROR: Model file not found: {pretained_path}")
         exit(1)
-
-    print(f"Loading pretrained model from: {pretrained_path}")
-    state = torch.load(pretrained_path, map_location='cpu')
-
+        
+    print(f"Loading pretrained model from: {pretained_path}")
+    state = torch.load(pretained_path, map_location='cpu')
+    
     if 'state_dict' in state:
         state_dict = state['state_dict']
     else:
         state_dict = state
-
+    
+    # 移除可能的'module.'前缀
     if all(key.startswith('module.') for key in state_dict.keys()):
         state_dict = {k[7:]: v for k, v in state_dict.items()}
-
+    
+    # 加载模型
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     print(f"Model loaded! Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
-
-    model = model.cuda()
+    
+    model.cuda()
     model.eval()
 
-    motion_kernel_size_list = opt['test'].get("motion_kernel_size_list", [9])
-    motion_angle_list = opt['test'].get("motion_angle_list", [90])
-    defocus_radius_list = opt['test'].get("defocus_radius_list", [0, 1, 2])
-
-    combo_results: Dict[Tuple[str, int, int], Tuple[float, float]] = {}
+    # -------------------------
+    #            test
+    # ------------------------
+    
+    avg_psnrs: Dict[str, List[float]] = {}
+    avg_ssims: Dict[str, List[float]] = {}
+    
+    sigma_size = len(opt['test']['sigma'])
     total_inference_time = 0
     total_batches = 0
 
-    combo_per_image = len(motion_kernel_size_list) * len(motion_angle_list) * len(defocus_radius_list)
-
-    print(f"\nStarting testing with {len(test_loaders)} loaders...")
-
+    print(f"\nStarting full testing with {len(test_loaders)} loaders...")
+    
+    # 循环遍历所有 DataLoader
     for loader_idx, test_loader in enumerate(test_loaders):
-        image_index = loader_idx // combo_per_image
-        rel_idx = loader_idx % combo_per_image
-
-        mk_idx = rel_idx // (len(motion_angle_list) * len(defocus_radius_list))
-        remain = rel_idx % (len(motion_angle_list) * len(defocus_radius_list))
-        ma_idx = remain // len(defocus_radius_list)
-        dr_idx = remain % len(defocus_radius_list)
-
-        dataset_name = names[image_index] if image_index < len(names) else f"Unknown_{image_index}"
-        motion_kernel_size = motion_kernel_size_list[mk_idx]
-        motion_angle = motion_angle_list[ma_idx]
-        defocus_radius = defocus_radius_list[dr_idx]
-
-        print(f"-> Processing: {dataset_name}, motion_k={motion_kernel_size}, angle={motion_angle}, defocus_r={defocus_radius}")
-
-        avg_psnr = 0.0
-        avg_ssim = 0.0
-        batch_count = 0
+        
+        avg_psnr = 0.
+        avg_ssim = 0.
+        
+        # 使用索引确定当前测试的是哪张图和哪个sigma
+        image_index = loader_idx // sigma_size
+        sigma_level = opt['test']['sigma'][loader_idx % sigma_size]
+        dataset_name = names[image_index] if image_index < len(names) else f"Unknown_Dataset_{image_index}"
+        
+        print(f'-> Processing: {dataset_name}, sigma={sigma_level}')
+        
         loader_inference_time = 0
-
+        batch_count = 0
+        
         with torch.no_grad():
-            for img_H, img_L in test_loader:
+            for batch_idx, (img_H, img_L, noise_level) in enumerate(test_loader):
                 batch_count += 1
+                
                 img_H = img_H.cuda()
                 img_L = img_L.cuda()
-
-                blur_level = torch.full((img_L.size(0), 1), 0.01, device=img_L.device, dtype=img_L.dtype)
+                noise_level = noise_level.cuda()
 
                 start_time = time.time()
-                test_out, _ = safe_forward(model, img_L, blur_level)
+                test_out, _ = safe_forward(model, img_L, noise_level)
                 batch_time = time.time() - start_time
-
+                
                 total_inference_time += batch_time
                 loader_inference_time += batch_time
                 total_batches += 1
 
+                # 计算指标
                 test_out_np = image.tensor2uint(test_out)
                 img_H_np = image.tensor2uint(img_H)
-
+                
                 psnr_ = image.calculate_psnr(test_out_np, img_H_np)
                 ssim_ = image.calculate_ssim(test_out_np, img_H_np)
-
                 avg_psnr += psnr_
                 avg_ssim += ssim_
 
+        # --------------------
+        # 计算该loader的平均值 (每个 loader 只有一个 batch/image)
+        # --------------------
         if batch_count > 0:
             avg_psnr = round(avg_psnr / batch_count, 2)
-            avg_ssim = round(avg_ssim / batch_count, 4)
+            avg_ssim = round(avg_ssim * 100 / batch_count, 2)
             avg_time = loader_inference_time / batch_count
+            
+            print(f'   Completed: PSNR={avg_psnr}, SSIM={avg_ssim}, Time={avg_time:.4f}s per batch/image')
+            
+            # 存储结果
+            if dataset_name not in avg_psnrs:
+                avg_psnrs[dataset_name] = []
+                avg_ssims[dataset_name] = []
+                
+            avg_psnrs[dataset_name].append(avg_psnr)
+            avg_ssims[dataset_name].append(avg_ssim)
 
-            combo_results[(dataset_name, motion_kernel_size, defocus_radius)] = (avg_psnr, avg_ssim)
-            print(f"   Completed: PSNR={avg_psnr}, SSIM={avg_ssim}, Time={avg_time:.4f}s")
-
+    # -------------------------
+    #       输出最终结果
+    # ------------------------
     if total_batches > 0:
         avg_inference_time = total_inference_time / total_batches
         logger.info(f'Average inference time (per batch/image): {avg_inference_time:.4f} s')
         print(f'\nAverage inference time (per batch/image): {avg_inference_time:.4f} s')
 
-    header = ['Dataset'] + [f'M{mk}_D{dr}' for mk in motion_kernel_size_list for dr in defocus_radius_list]
-
+    # 输出表格
+    header = ['Dataset'] + [f'σ={s}' for s in opt['test']['sigma']]
+    
     t_psnr = PrettyTable(header)
+    for key, value in avg_psnrs.items():
+        t_psnr.add_row([key] + value)
+    
     t_ssim = PrettyTable(header)
-
-    for name in names:
-        row_psnr = [name]
-        row_ssim = [name]
-        for mk in motion_kernel_size_list:
-            for dr in defocus_radius_list:
-                key = (name, mk, dr)
-                if key in combo_results:
-                    row_psnr.append(combo_results[key][0])
-                    row_ssim.append(combo_results[key][1])
-                else:
-                    row_psnr.append('--')
-                    row_ssim.append('--')
-
-        t_psnr.add_row(row_psnr)
-        t_ssim.add_row(row_ssim)
+    for key, value in avg_ssims.items():
+        t_ssim.add_row([key] + value)
 
     logger.info(f"Test PSNR:\n{t_psnr}")
     logger.info(f"Test SSIM:\n{t_ssim}")
-
+    
     print(f"\nFinal Test Results:")
     print(f"Test PSNR:\n{t_psnr}")
     print(f"\nTest SSIM:\n{t_ssim}")
+    
+    print(f"\nTesting completed! Processed {total_batches} batches across {len(avg_psnrs)} datasets.")
+    
+    # -------------------------
+    # 新增: 总体平均 PSNR/SSIM 计算 (数据集平均值)
+    # -------------------------
+    
+    final_avg_psnr: Dict[str, float] = {}
+    final_avg_ssim: Dict[str, float] = {}
+    
+    for sigma_idx, sigma_level in enumerate(opt['test']['sigma']):
+        sigma_key = f'σ={sigma_level}'
+        
+        # 收集该sigma级别下所有图像的PSNR和SSIM
+        psnrs_at_sigma = [vals[sigma_idx] for vals in avg_psnrs.values() if len(vals) > sigma_idx]
+        ssims_at_sigma = [vals[sigma_idx] for vals in avg_ssims.values() if len(vals) > sigma_idx]
+        
+        # 计算平均值
+        if psnrs_at_sigma:
+            final_avg_psnr[sigma_key] = round(sum(psnrs_at_sigma) / len(psnrs_at_sigma), 2)
+        if ssims_at_sigma:
+            final_avg_ssim[sigma_key] = round(sum(ssims_at_sigma) / len(ssims_at_sigma), 2)
 
-    overall_psnr = []
-    overall_ssim = []
-
-    for _, v in combo_results.items():
-        overall_psnr.append(v[0])
-        overall_ssim.append(v[1])
-
-    if overall_psnr:
-        print(f"\nOverall Avg. PSNR: {sum(overall_psnr)/len(overall_psnr):.2f}")
-    if overall_ssim:
-        print(f"Overall Avg. SSIM: {sum(overall_ssim)/len(overall_ssim):.4f}")
+    t_overall_psnr = PrettyTable(['Metric'] + list(final_avg_psnr.keys()))
+    t_overall_psnr.add_row(['Overall Avg. PSNR'] + list(final_avg_psnr.values()))
+    
+    t_overall_ssim = PrettyTable(['Metric'] + list(final_avg_ssim.keys()))
+    t_overall_ssim.add_row(['Overall Avg. SSIM'] + list(final_avg_ssim.values()))
+    
+    print(f"\nOverall Average Results (Dataset Average):")
+    print(f"Overall PSNR:\n{t_overall_psnr}")
+    print(f"Overall SSIM:\n{t_overall_ssim}")

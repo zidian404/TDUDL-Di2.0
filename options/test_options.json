@@ -1,24 +1,20 @@
 {
   "task": "test",
   "log_path": "./log",
-  "gpu_ids": [0],
-  "batch_size": 1,
+  "gpu_ids": [0,1,2,3],
+  "batch_size": 1, 
   "nc": [16, 1],
-  "patch_size": [128, 128],
+  "patch_size": [128, 128], 
   "stride_size": [16, 16],
-  "d_size": 3,
-  "max_epoch": 80,
-  "stage": 1,
+  "d_size": 3,           
+  "max_epoch": 80, 
+  "stage": 3,
   "scale": 3,
   "n_channels": 1,
   "pretained_path": "./model_save/model_best.pth",
-
   "test": {
-    "blur_type": "motion_defocus_mix",
-    "motion_kernel_size_list": [5, 9],
-    "motion_angle_list": [90],
-    "defocus_radius_list": [0, 2, 3],
-    "dataroot_H": "./dataset/gray_test",
-    "n_channels": 1
+      "sigma": [0],
+      "dataroot_H":  "./dataset/gray_test" ,//"./test_data/color"  "../dataset/color_test"
+      "n_channels": 1
   }
 }

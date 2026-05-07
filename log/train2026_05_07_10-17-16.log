@@ -1,0 +1,48 @@
+26-05-07 10:17:16.917 :   task: train
+  gpu_ids: [0]
+  log_path: ./log
+  model_save: ./model_save
+  pretained_path:[
+    index: False
+    path: ./model_save/model_best1.pth
+  ]
+  batch_size: 4
+  nc: [16, 1]
+  patch_size: [128, 128]
+  stride_size: [16, 16]
+  atoms: 50
+  d_size: 3
+  max_epoch: 1000
+  stage: 3
+  lr: 0.0001
+  loss_function_index: 1
+  n_channels: 1
+  train:[
+    sigma: [0]
+    dataroot_H: ./dataset/gray_train_all
+    H_size: 128
+    n_channels: 1
+  ]
+  valid:[
+    sigma: [0]
+    dataroot_H: ./dataset/gray_valid_all
+    n_channels: 1
+  ]
+  opt_path: ./options/train_options.json
+  is_train: True
+  scale: 1
+
+26-05-07 10:17:18.069 : Number of parameter: 3.26M
+26-05-07 10:17:18.069 : start training...
+26-05-07 10:17:21.905 : 训练出错，进度已保存: Caught IndexError in DataLoader worker process 0.
+Original Traceback (most recent call last):
+  File "C:\Users\CLDF\.conda\envs\TDUD\lib\site-packages\torch\utils\data\_utils\worker.py", line 349, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+  File "C:\Users\CLDF\.conda\envs\TDUD\lib\site-packages\torch\utils\data\_utils\fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "C:\Users\CLDF\.conda\envs\TDUD\lib\site-packages\torch\utils\data\_utils\fetch.py", line 52, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "C:\Users\CLDF\Desktop\TDUD1-Di2.0\utils\dataset_admm.py", line 59, in __getitem__
+    [np.random.uniform(self.sigma[0], self.sigma[1])]) / 255.0
+IndexError: list index out of range
+

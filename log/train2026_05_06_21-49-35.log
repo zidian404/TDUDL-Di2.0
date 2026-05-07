@@ -1,0 +1,38 @@
+26-05-06 21:49:35.334 :   task: train
+  gpu_ids: [0]
+  log_path: ./log
+  model_save: ./model_save
+  pretained_path:[
+    index: False
+    path: ./model_save/model_best1.pth
+  ]
+  batch_size: 4
+  nc: [16, 1]
+  patch_size: [128, 128]
+  stride_size: [16, 16]
+  atoms: 50
+  d_size: 3
+  max_epoch: 1000
+  stage: 1
+  lr: 0.0001
+  loss_function_index: 1
+  n_channels: 1
+  train:[
+    sigma: [0]
+    dataroot_H: ./dataset/gray_train_all
+    H_size: 128
+    n_channels: 1
+  ]
+  valid:[
+    sigma: [0]
+    dataroot_H: ./dataset/gray_valid_all
+    n_channels: 1
+  ]
+  opt_path: ./options/train_options.json
+  is_train: True
+  scale: 1
+
+26-05-06 21:49:35.340 : 训练集大小: 1120
+26-05-06 21:49:35.340 : 验证集数量: 240 (每个 sigma 一个 Dataset)
+26-05-06 21:49:36.489 : Number of parameter: 3.26M
+26-05-06 21:49:36.489 : start training...
